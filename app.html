@@ -11,6 +11,9 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400&family=Newsreader:ital,opsz,wght@0,6..72,200;0,6..72,300;1,6..72,200;1,6..72,300&display=swap" rel="stylesheet">
 <!-- Google Identity Services (for sign-out) -->
 <script src="https://accounts.google.com/gsi/client" async defer></script>
+<!-- Firebase SDK (compat — works in plain HTML, no bundler) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <style>
 /* ============================================================
    meridian. — celestial focus
@@ -1121,6 +1124,29 @@ input[type="number"]::-webkit-inner-spin-button{ -webkit-appearance:none; margin
   };
 
   /* ---------- persistence ---------- */
+
+  // Debounced Firestore write — batches rapid changes into one write per 4s
+  let _fsTimer = null;
+  function saveToFirestore(){
+    if(!window.__meridianDB || !window.__meridianUID) return;
+    clearTimeout(_fsTimer);
+    _fsTimer = setTimeout(function(){
+      const payload = {
+        settings: state.settings,
+        stats: state.stats,
+        tasks: state.tasks,
+        mode: state.mode,
+        updatedAt: Date.now()
+      };
+      window.__meridianDB
+        .collection('users')
+        .doc(window.__meridianUID)
+        .set(payload)
+        .catch(function(e){ console.warn('meridian: firestore write failed', e); });
+    }, 4000);
+  }
+
+  // Always write to localStorage immediately; schedule Firestore write
   function save(){
     try{
       localStorage.setItem(STORE_KEY, JSON.stringify({
@@ -1130,21 +1156,59 @@ input[type="number"]::-webkit-inner-spin-button{ -webkit-appearance:none; margin
         mode: state.mode
       }));
     }catch(e){}
+    saveToFirestore();
   }
+
+  // Merge remote data into state (remote wins on stats, local wins on tasks if newer)
+  function applyData(data){
+    if(!data) return;
+    if(data.settings) state.settings = { ...state.settings, ...data.settings,
+      pomodoro:   { ...state.settings.pomodoro,    ...(data.settings.pomodoro||{}) },
+      animedoro:  { ...state.settings.animedoro,   ...(data.settings.animedoro||{}) },
+      'five-two': { ...state.settings['five-two'], ...(data.settings['five-two']||{}) }
+    };
+    if(data.stats) state.stats = { ...state.stats, ...data.stats, perDay: data.stats.perDay||{} };
+    if(Array.isArray(data.tasks)) state.tasks = data.tasks;
+    if(data.mode && MODE_DEFAULTS[data.mode]) state.mode = data.mode;
+  }
+
+  // Load from localStorage first (instant), then Firestore (async refresh)
   function load(){
+    // 1. Local cache — makes the app feel instant
     try{
       const raw = localStorage.getItem(STORE_KEY);
-      if(!raw) return;
-      const data = JSON.parse(raw);
-      if(data.settings) state.settings = { ...state.settings, ...data.settings,
-        pomodoro: { ...state.settings.pomodoro, ...(data.settings.pomodoro||{}) },
-        animedoro:{ ...state.settings.animedoro, ...(data.settings.animedoro||{}) },
-        'five-two': { ...state.settings['five-two'], ...(data.settings['five-two']||{}) }
-      };
-      if(data.stats) state.stats = { ...state.stats, ...data.stats, perDay: data.stats.perDay||{} };
-      if(Array.isArray(data.tasks)) state.tasks = data.tasks;
-      if(data.mode && MODE_DEFAULTS[data.mode]) state.mode = data.mode;
+      if(raw) applyData(JSON.parse(raw));
     }catch(e){}
+
+    // 2. Firestore — load fresh data and re-render if newer
+    if(window.__meridianDB && window.__meridianUID){
+      window.__meridianDB
+        .collection('users')
+        .doc(window.__meridianUID)
+        .get()
+        .then(function(doc){
+          if(doc.exists){
+            const remote = doc.data();
+            // Only overwrite if remote is newer than local cache
+            const localRaw = localStorage.getItem(STORE_KEY);
+            let localTime = 0;
+            try{ localTime = JSON.parse(localRaw||'{}').updatedAt || 0; }catch(e){}
+            if((remote.updatedAt || 0) >= localTime){
+              applyData(remote);
+              // Persist remote data into localStorage so next load is instant
+              try{ localStorage.setItem(STORE_KEY, JSON.stringify(remote)); }catch(e){}
+              // Re-render with fresh remote data
+              syncSettingsUI();
+              renderTasks();
+              render();
+            }
+          } else {
+            // First time this user signs in — push local data up to Firestore
+            saveToFirestore();
+          }
+        })
+        .catch(function(e){ console.warn('meridian: firestore read failed', e); });
+    }
   }
 
   /* ---------- date helpers ---------- */
@@ -2027,8 +2091,36 @@ input[type="number"]::-webkit-inner-spin-button{ -webkit-appearance:none; margin
     tickClock();
     setInterval(tickClock, 1000);
 
-    // batched save loop (so focusSec persists)
-    setInterval(()=>{ if(state.running) save(); }, 5000);
+    // batched save loop (so focusSec persists every 5s while running)
+    setInterval(()=>{
+      if(state.running){
+        // flush any pending debounce immediately
+        clearTimeout(_fsTimer);
+        _fsTimer = null;
+        try{
+          localStorage.setItem(STORE_KEY, JSON.stringify({
+            settings: state.settings,
+            stats: state.stats,
+            tasks: state.tasks,
+            mode: state.mode,
+            updatedAt: Date.now()
+          }));
+        }catch(e){}
+        if(window.__meridianDB && window.__meridianUID){
+          window.__meridianDB
+            .collection('users')
+            .doc(window.__meridianUID)
+            .set({
+              settings: state.settings,
+              stats: state.stats,
+              tasks: state.tasks,
+              mode: state.mode,
+              updatedAt: Date.now()
+            })
+            .catch(function(e){ console.warn('meridian: periodic firestore write failed', e); });
+        }
+      }
+    }, 5000);
   }
 
   // expose for debugging
@@ -2040,13 +2132,36 @@ input[type="number"]::-webkit-inner-spin-button{ -webkit-appearance:none; margin
 </script>
 <script>
 /* ============================================================
-   meridian. — auth layer (Google Identity Services)
+   meridian. — auth layer (Google Identity Services + Firebase)
    ============================================================ */
 (function(){
   'use strict';
 
-  const USER_KEY  = 'meridian.user';
+  const USER_KEY    = 'meridian.user';
   const SESSION_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+  /* ── Firebase config — REPLACE these values with yours ── */
+  const FIREBASE_CONFIG = {
+    apiKey:            "AIzaSyAXCwQxC2FGObO0VUs5WnG1mW0_8J_yrKA",
+    authDomain:        "meridianfocuss.firebaseapp.com",
+    projectId:         "meridianfocuss",
+    storageBucket:     "meridianfocuss.firebasestorage.app",
+    messagingSenderId: "971898641422",
+    appId:             "1:971898641422:web:3b455d2443636e4766305f"
+  };
+
+  /* ── init Firebase ── */
+  function initFirebase(uid){
+    try{
+      if(!firebase.apps.length){
+        firebase.initializeApp(FIREBASE_CONFIG);
+      }
+      window.__meridianDB  = firebase.firestore();
+      window.__meridianUID = uid;
+    }catch(e){
+      console.warn('meridian: firebase init failed', e);
+    }
+  }
 
   /* ── get stored user ── */
   function getUser(){
@@ -2055,7 +2170,7 @@ input[type="number"]::-webkit-inner-spin-button{ -webkit-appearance:none; margin
       if(!raw) return null;
       const u = JSON.parse(raw);
       if(!u || !u.email) return null;
-      if(u.exp && Date.now() > u.exp) return null; // expired
+      if(u.exp && Date.now() > u.exp) return null;
       return u;
     }catch(e){ return null; }
   }
@@ -2063,6 +2178,8 @@ input[type="number"]::-webkit-inner-spin-button{ -webkit-appearance:none; margin
   /* ── sign out ── */
   function signOut(){
     localStorage.removeItem(USER_KEY);
+    window.__meridianDB  = null;
+    window.__meridianUID = null;
     if(typeof google !== 'undefined' && google.accounts){
       google.accounts.id.disableAutoSelect();
     }
@@ -2071,14 +2188,13 @@ input[type="number"]::-webkit-inner-spin-button{ -webkit-appearance:none; margin
 
   /* ── render user in header ── */
   function renderUser(user){
-    const block = document.getElementById('userBlock');
-    const avatar = document.getElementById('userAvatar');
+    const block          = document.getElementById('userBlock');
+    const avatar         = document.getElementById('userAvatar');
     const avatarFallback = document.getElementById('userAvatarFallback');
-    const nameEl = document.getElementById('userName');
+    const nameEl         = document.getElementById('userName');
 
     block.style.display = 'flex';
 
-    // first name only for compact display
     const firstName = (user.name || '').split(' ')[0] || user.email.split('@')[0];
     nameEl.textContent = firstName;
 
@@ -2115,16 +2231,18 @@ input[type="number"]::-webkit-inner-spin-button{ -webkit-appearance:none; margin
     const user = getUser();
 
     if(!user){
-      // no valid session — redirect to landing
       window.location.href = 'index.html';
       return;
     }
 
-    // valid session — show the app
+    // Init Firebase with this user's Google sub as document ID
+    initFirebase(user.sub);
+
+    // Show the app
     hideGate();
     renderUser(user);
 
-    // refresh session expiry on each visit
+    // Refresh session TTL on each visit
     user.exp = Date.now() + SESSION_TTL;
     try{ localStorage.setItem(USER_KEY, JSON.stringify(user)); }catch(e){}
   })();
